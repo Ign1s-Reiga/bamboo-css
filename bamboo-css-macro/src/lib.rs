@@ -149,6 +149,48 @@ fn write_fragment(workspace_root: &PathBuf, hash: &str, css: &str) -> Result<(),
     Ok(())
 }
 
+/// Validates, scopes, and extracts CSS at compile time, returning the
+/// auto-generated class name as a `&'static str`.
+///
+/// The CSS body is processed through [lightningcss](https://lightningcss.dev/):
+/// nesting is resolved, vendor prefixes are added, and the output is minified.
+/// Styles are scoped to an auto-generated hash class (e.g. `.css-a1b2c3d4`),
+/// so they never leak to other elements.  A CSS fragment is written to
+/// `target/styled-fragments/{hash}.css`; `bamboo-css-collector` picks these up
+/// before each Trunk build and assembles the final bundle.
+///
+/// A `compile_error!` is emitted if the CSS is invalid, giving you IDE
+/// diagnostics without a runtime panic.
+///
+/// # Syntax
+///
+/// ```text
+/// css! { /* CSS properties and nested rules */ }
+/// ```
+///
+/// The `&` selector refers to the scoped class, just like in CSS nesting.
+///
+/// # Example (Leptos)
+///
+/// ```rust
+/// use bamboo_css_macro::css;
+///
+/// #[component]
+/// fn MyButton() -> impl IntoView {
+///     let class = css! {
+///         padding: 0.5rem 1rem;
+///         border-radius: 4px;
+///         background-color: royalblue;
+///         color: white;
+///
+///         &:hover {
+///             background-color: steelblue;
+///         }
+///     };
+///
+///     view! { <button class=class>"Click me"</button> }
+/// }
+/// ```
 #[proc_macro]
 pub fn css(input: TokenStream) -> TokenStream {
     let input2: TokenStream2 = input.into();
