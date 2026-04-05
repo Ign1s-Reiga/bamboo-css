@@ -126,4 +126,7 @@ Options:
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+This project is licensed under the **MIT License**.  
+See the [LICENSE](LICENSE) file for details.
+
+*Note: This project depends on [lightningcss](https://github.com/parcel-bundler/lightningcss), which is licensed under the MPL-2.0.*
