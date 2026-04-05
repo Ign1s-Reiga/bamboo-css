@@ -62,6 +62,18 @@ Add the collector as a `pre_build` hook and reference the bundle in your `index.
 stage = "pre_build"
 command = "bamboo-css-collector"
 command_arguments = []
+
+# or
+
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = [
+    "run",
+    "--git", "https://github.com/Ign1s-Reiga/bamboo-css.git",
+    "--bin", "bamboo-css-collector",
+    "--quiet",
+]
 ```
 
 ```html
