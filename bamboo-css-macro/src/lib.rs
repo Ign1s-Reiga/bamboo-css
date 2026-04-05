@@ -95,7 +95,9 @@ fn generate_hash(css_body: &str) -> String {
     format!("css-{:08x}", h.finish() as u32)
 }
 
-/// Wraps the user's CSS body in a scoped selector, then runs it through
+/// Wraps the CSS body in `.{hash} { … }`, runs it through lightningcss
+/// (nesting resolution, vendor prefixes, minification), and returns the
+/// resulting CSS string.
 fn process_css(hash: &str, body: &str) -> Result<String, String> {
     use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
 
@@ -269,8 +271,14 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream
 ///
 /// Processes the CSS through the same pipeline as `css!` (hash, validate,
 /// minify, write fragment) and emits a `#[component]` function with the given
-/// name.  The component accepts `children` and renders them inside the
-/// specified HTML element with the auto-generated class applied.
+/// name.  Arbitrary HTML attributes are forwarded to the underlying element
+/// via `AttributeInterceptor`, so props like `value`, `type`, `href`, etc.
+/// all work without any extra configuration.
+///
+/// **Void elements** (`input`, `img`, `br`, …) generate a component with no
+/// `children` prop.  All other elements accept `children`.
+///
+/// The scoped class is always applied; it cannot be overridden by callers.
 ///
 /// # Syntax
 ///
@@ -287,16 +295,24 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream
 /// ```rust
 /// use bamboo_css_macro::styled;
 ///
+/// // Normal element — accepts children
 /// styled!(Card, div, {
 ///     padding: 1rem;
 ///     border-radius: 8px;
 ///     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
 /// });
 ///
+/// // Void element — no children, props forwarded as HTML attributes
+/// styled!(StyledInput, input, {
+///     border: none;
+///     padding: 0.5rem;
+/// });
+///
 /// #[component]
 /// fn App() -> impl IntoView {
 ///     view! {
 ///         <Card><p>"Hello"</p></Card>
+///         <StyledInput attr:type="text" attr:placeholder="Enter text…" />
 ///     }
 /// }
 /// ```
@@ -342,25 +358,34 @@ pub fn styled(input: TokenStream) -> TokenStream {
     ];
 
     if VOID_ELEMENTS.contains(&tag.as_str()) {
-        // Self-closing: no children prop, render as `<tag class=… />`
+        // Self-closing: no children prop; forward arbitrary HTML attributes
+        // via `#[prop(attrs)]` (e.g. `value`, `type`, `placeholder`, …).
         quote! {
             #[::leptos::component]
             fn #component_ident() -> impl ::leptos::IntoView {
+                use ::leptos::attribute_interceptor::AttributeInterceptor;
                 ::leptos::view! {
-                    <#tag_ident class=#hash_lit />
+                    <AttributeInterceptor let:attr>
+                        <#tag_ident class=#hash_lit  {..attr}/>
+                    </AttributeInterceptor>
                 }
             }
         }
         .into()
     } else {
-        // Normal element: accept children and render them inside the element.
+        // Normal element: accept children plus arbitrary HTML attributes.
         quote! {
             #[::leptos::component]
-            fn #component_ident(children: ::leptos::children::Children) -> impl ::leptos::IntoView {
+            fn #component_ident(
+                children: ::leptos::children::ChildrenFn,
+            ) -> impl ::leptos::IntoView {
+                use ::leptos::attribute_interceptor::AttributeInterceptor;
                 ::leptos::view! {
-                    <#tag_ident class=#hash_lit>
-                        {children()}
-                    </#tag_ident>
+                    <AttributeInterceptor let:attr>
+                        <#tag_ident class=#hash_lit  {..attr}>
+                            {children()}
+                        </#tag_ident>
+                    </AttributeInterceptor>
                 }
             }
         }

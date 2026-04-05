@@ -6,6 +6,10 @@ Inspired by CSS-in-JS solutions like [emotion](https://emotion.sh/).
 
 ## Overview
 
+bamboo-css provides three macros.
+
+### `css!` — inline scoped class
+
 ```rust
 let class = css! {
     background-color: red;
@@ -20,13 +24,54 @@ let class = css! {
 // class == "css-a1b2c3d4"
 ```
 
-The `css!` macro:
 - Validates CSS at compile time using [lightningcss](https://lightningcss.dev/)
 - Resolves nesting, applies vendor prefixes, and minifies
 - Scopes styles under an auto-generated hash class (e.g. `.css-a1b2c3d4`)
 - Writes a CSS fragment to `target/styled-fragments/` — no runtime injection
+- Expands to a `&'static str` holding the class name
 
-`bamboo-css-collector` is a CLI tool that runs as a Trunk `pre_build` hook. It scans your source tree, eliminates dead CSS (fragments from deleted `css!` calls), and writes a single `bundle.css` for Trunk to pick up.
+### `styled!` — scoped Leptos component
+
+Defines a full Leptos `#[component]` backed by a single HTML element.
+Arbitrary HTML attributes (e.g. `value`, `type`, `href`) are forwarded automatically.
+Void elements (`input`, `img`, `br`, …) are rendered self-closing with no `children` prop.
+
+```rust
+// Normal element
+styled!(Card, div, {
+    padding: 1rem;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+});
+
+// Void element
+styled!(StyledInput, input, {
+    border: none;
+    padding: 0.5rem;
+});
+
+view! {
+    <Card><p>"Hello"</p></Card>
+    <StyledInput type="text" placeholder="Enter text…" />
+}
+```
+
+### `cx!` — class name combiner
+
+Joins one or more class-name expressions into a single space-separated `String` at runtime, skipping empty values.
+
+```rust
+let base      = css! { padding: 0.5rem 1rem; };
+let highlight = css! { background-color: royalblue; color: white; };
+
+view! {
+    <button class=cx!(base, if active.get() { highlight } else { "" })>
+        "Click"
+    </button>
+}
+```
+
+`bamboo-css-collector` is a CLI tool that runs as a Trunk `pre_build` hook. It scans your source tree, eliminates dead CSS (fragments from deleted `css!` / `styled!` calls), and writes a single `bundle.css` for Trunk to pick up.
 
 ## Installation
 
@@ -121,7 +166,7 @@ Options:
 ## How it works
 
 1. **Macro** — `css!` tokenizes the input, generates a content-based hash, validates and processes the CSS through lightningcss, then writes `target/styled-fragments/{hash}.css`. The macro expands to the hash string `"css-{hash}"`.
-2. **Collector** — Before each Trunk build, the collector scans `src/` for all `css!` invocations, re-derives each hash, and bundles only the corresponding fragment files. Fragments from deleted `css!` calls are excluded (dead-code elimination) without removing any files from `target/`.
+2. **Collector** — Before each Trunk build, the collector scans `src/` for all `css!` and `styled!` invocations, re-derives each hash, and bundles only the corresponding fragment files. Fragments from deleted calls are excluded (dead-code elimination) without removing any files from `target/`.
 3. **Trunk** — Detects `<link data-trunk rel="css">` in `index.html`, fingerprints and copies the bundle to `dist/`.
 
 ## License
