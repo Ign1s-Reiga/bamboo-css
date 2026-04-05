@@ -177,13 +177,26 @@ pub fn css(input: TokenStream) -> TokenStream {
     quote! { #lit }.into()
 }
 
-/// Parses `tag , { css_body }` from the input token stream.
-/// Accepts the tag as either a bare ident (`div`) or a string literal (`"div"`).
-/// The CSS block must be brace-delimited.
-fn parse_styled_args(input: TokenStream2) -> Option<(String, TokenStream2)> {
+/// Parses `ComponentName , tag , { css_body }` from the input token stream.
+/// - `ComponentName`: bare ident — the name of the generated Leptos component function
+/// - `tag`: bare ident or string literal — the HTML element to render
+/// - `{ css_body }`: brace-delimited CSS
+fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream2)> {
     let mut iter = input.into_iter();
 
-    // First token: HTML tag name
+    // First token: component function name (must be a bare ident)
+    let component = match iter.next()? {
+        TokenTree::Ident(id) => id.to_string(),
+        _ => return None,
+    };
+
+    // Separator
+    match iter.next()? {
+        TokenTree::Punct(p) if p.as_char() == ',' => {}
+        _ => return None,
+    }
+
+    // Second token: HTML tag name
     let tag = match iter.next()? {
         TokenTree::Ident(id) => id.to_string(),
         TokenTree::Literal(lit) => lit.to_string().trim_matches('"').to_string(),
@@ -196,7 +209,7 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, TokenStream2)> {
         _ => return None,
     }
 
-    // CSS block — may be a braced group or bare tokens (tolerate both)
+    // CSS block — must be brace-delimited
     let css = match iter.next()? {
         TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => g.stream(),
         tt => {
@@ -207,47 +220,51 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, TokenStream2)> {
         }
     };
 
-    Some((tag, css))
+    Some((component, tag, css))
 }
 
-/// Creates a scoped CSS fragment (identical pipeline to `css!`) and expands to
-/// a **closure** that wraps `children` in the given HTML element with the
-/// auto-generated class applied.  Users never need to know the class name.
+/// Defines a scoped Leptos component backed by a plain HTML element.
+///
+/// Processes the CSS through the same pipeline as `css!` (hash, validate,
+/// minify, write fragment) and emits a `#[component]` function with the given
+/// name.  The component accepts `children` and renders them inside the
+/// specified HTML element with the auto-generated class applied.
 ///
 /// # Syntax
 ///
 /// ```text
-/// styled!(tag, { /* CSS */ })
+/// styled!(ComponentName, tag, { /* CSS */ });
 /// ```
 ///
-/// `tag` is a bare HTML element name (`div`, `button`, `span`, …) or a
-/// double-quoted string literal (`"div"`).
+/// - `ComponentName` — the identifier of the generated Leptos component
+/// - `tag` — a bare HTML element name (`div`, `button`, `span`, …) or a
+///   double-quoted string literal (`"div"`)
 ///
 /// # Example (Leptos)
 ///
 /// ```rust
 /// use bamboo_css_macro::styled;
 ///
+/// styled!(Card, div, {
+///     padding: 1rem;
+///     border-radius: 8px;
+///     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+/// });
+///
 /// #[component]
 /// fn App() -> impl IntoView {
-///     let Card = styled!(div, {
-///         padding: 1rem;
-///         border-radius: 8px;
-///         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-///     });
-///
 ///     view! {
-///         {Card(Box::new(|| view! { <p>"Hello"</p> }))}
+///         <Card><p>"Hello"</p></Card>
 ///     }
 /// }
 /// ```
 #[proc_macro]
 pub fn styled(input: TokenStream) -> TokenStream {
-    let (tag, css_tokens) = match parse_styled_args(input.into()) {
+    let (component, tag, css_tokens) = match parse_styled_args(input.into()) {
         Some(v) => v,
         None => {
             return quote! {
-                compile_error!("bamboo-css: styled! expects `styled!(tag, { /* CSS */ })`")
+                compile_error!("bamboo-css: styled! expects `styled!(ComponentName, tag, { /* CSS */ })`")
             }
             .into();
         }
@@ -271,22 +288,42 @@ pub fn styled(input: TokenStream) -> TokenStream {
         return quote! { compile_error!(#msg) }.into();
     }
 
+    let component_ident =
+        proc_macro2::Ident::new(&component, proc_macro2::Span::call_site());
     let tag_ident = proc_macro2::Ident::new(&tag, proc_macro2::Span::call_site());
     let hash_lit = proc_macro2::Literal::string(&hash);
 
-    // Return a closure: |children: ::leptos::Children| -> impl IntoView
-    // The tag and class are baked in; the user supplies only the children.
-    quote! {
-        move |children: ::leptos::Children| {
-            let __class = #hash_lit;
-            ::leptos::view! {
-                <#tag_ident class=__class>
-                    {children()}
-                </#tag_ident>
+    // Cannot have children or a closing tag.
+    const VOID_ELEMENTS: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr",
+    ];
+
+    if VOID_ELEMENTS.contains(&tag.as_str()) {
+        // Self-closing: no children prop, render as `<tag class=… />`
+        quote! {
+            #[::leptos::component]
+            fn #component_ident() -> impl ::leptos::IntoView {
+                ::leptos::view! {
+                    <#tag_ident class=#hash_lit />
+                }
             }
         }
+        .into()
+    } else {
+        // Normal element: accept children and render them inside the element.
+        quote! {
+            #[::leptos::component]
+            fn #component_ident(children: ::leptos::children::Children) -> impl ::leptos::IntoView {
+                ::leptos::view! {
+                    <#tag_ident class=#hash_lit>
+                        {children()}
+                    </#tag_ident>
+                }
+            }
+        }
+        .into()
     }
-    .into()
 }
 
 /// Splits a `TokenStream` on top-level commas.
