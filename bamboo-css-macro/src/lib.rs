@@ -176,3 +176,75 @@ pub fn css(input: TokenStream) -> TokenStream {
     let lit = proc_macro2::Literal::string(&hash);
     quote! { #lit }.into()
 }
+
+/// Splits a `TokenStream` on top-level commas.
+fn split_by_comma(input: TokenStream2) -> Vec<TokenStream2> {
+    let mut args: Vec<TokenStream2> = Vec::new();
+    let mut current = TokenStream2::new();
+
+    for tt in input {
+        match &tt {
+            TokenTree::Punct(p) if p.as_char() == ',' => {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current = TokenStream2::new();
+                }
+            }
+            _ => current.extend(std::iter::once(tt)),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+/// Joins one or more class-name expressions into a single space-separated
+/// `String` at runtime, skipping any value that is empty after conversion.
+///
+/// Each argument may be any expression that implements `Into<String>` —
+/// typically a `&str` literal, the result of `css!`, or a conditional
+/// expression such as `if condition { active_class } else { "" }`.
+///
+/// # Example (Leptos)
+///
+/// ```rust
+/// use bamboo_css_macro::{css, cx};
+///
+/// #[component]
+/// fn Button(active: ReadSignal<bool>) -> impl IntoView {
+///     let base = css! { padding: 0.5rem 1rem; border-radius: 4px; };
+///     let highlighted = css! { background-color: royalblue; color: white; };
+///
+///     view! {
+///         <button class=cx!(base, if active.get() { highlighted } else { "" })>
+///             "Click"
+///         </button>
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn cx(input: TokenStream) -> TokenStream {
+    let args = split_by_comma(input.into());
+
+    let stmts = args.iter().map(|arg| {
+        quote! {
+            {
+                let __s = ::std::string::String::from(#arg);
+                if !__s.is_empty() {
+                    __parts.push(__s);
+                }
+            }
+        }
+    });
+
+    quote! {
+        {
+            let mut __parts: ::std::vec::Vec<::std::string::String> =
+                ::std::vec::Vec::new();
+            #(#stmts)*
+            __parts.join(" ")
+        }
+    }
+    .into()
+}

@@ -44,12 +44,10 @@ bamboo-css-macro = { git = "https://github.com/Ign1s-Reiga/bamboo-css" }
 cargo install bamboo-css-collector --git https://github.com/Ign1s-Reiga/bamboo-css
 ```
 
-Or add it as a dev-dependency and run it with `cargo run`:
+Or clone the repository:
 
-```toml
-# Cargo.toml
-[dev-dependencies]
-bamboo-css-collector = { git = "https://github.com/Ign1s-Reiga/bamboo-css" }
+```bash
+git clone https://github.com/Ign1s-Reiga/bamboo-css.git
 ```
 
 ### 3. Configure Trunk
@@ -58,6 +56,9 @@ Add the collector as a `pre_build` hook and reference the bundle in your `index.
 
 ```toml
 # Trunk.toml
+[watch]
+ignore = ["assets/bundle.css"]
+
 [[hooks]]
 stage = "pre_build"
 command = "bamboo-css-collector"
@@ -70,8 +71,7 @@ stage = "pre_build"
 command = "cargo"
 command_arguments = [
     "run",
-    "--git", "https://github.com/Ign1s-Reiga/bamboo-css.git",
-    "--bin", "bamboo-css-collector",
+    "--manifest-path", "../../bamboo-css/bamboo-css-collector/Cargo.toml",
     "--quiet",
 ]
 ```
