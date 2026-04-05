@@ -177,6 +177,118 @@ pub fn css(input: TokenStream) -> TokenStream {
     quote! { #lit }.into()
 }
 
+/// Parses `tag , { css_body }` from the input token stream.
+/// Accepts the tag as either a bare ident (`div`) or a string literal (`"div"`).
+/// The CSS block must be brace-delimited.
+fn parse_styled_args(input: TokenStream2) -> Option<(String, TokenStream2)> {
+    let mut iter = input.into_iter();
+
+    // First token: HTML tag name
+    let tag = match iter.next()? {
+        TokenTree::Ident(id) => id.to_string(),
+        TokenTree::Literal(lit) => lit.to_string().trim_matches('"').to_string(),
+        _ => return None,
+    };
+
+    // Separator
+    match iter.next()? {
+        TokenTree::Punct(p) if p.as_char() == ',' => {}
+        _ => return None,
+    }
+
+    // CSS block — may be a braced group or bare tokens (tolerate both)
+    let css = match iter.next()? {
+        TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => g.stream(),
+        tt => {
+            let mut ts = TokenStream2::new();
+            ts.extend(std::iter::once(tt));
+            ts.extend(iter);
+            ts
+        }
+    };
+
+    Some((tag, css))
+}
+
+/// Creates a scoped CSS fragment (identical pipeline to `css!`) and expands to
+/// a **closure** that wraps `children` in the given HTML element with the
+/// auto-generated class applied.  Users never need to know the class name.
+///
+/// # Syntax
+///
+/// ```text
+/// styled!(tag, { /* CSS */ })
+/// ```
+///
+/// `tag` is a bare HTML element name (`div`, `button`, `span`, …) or a
+/// double-quoted string literal (`"div"`).
+///
+/// # Example (Leptos)
+///
+/// ```rust
+/// use bamboo_css_macro::styled;
+///
+/// #[component]
+/// fn App() -> impl IntoView {
+///     let Card = styled!(div, {
+///         padding: 1rem;
+///         border-radius: 8px;
+///         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+///     });
+///
+///     view! {
+///         {Card(Box::new(|| view! { <p>"Hello"</p> }))}
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn styled(input: TokenStream) -> TokenStream {
+    let (tag, css_tokens) = match parse_styled_args(input.into()) {
+        Some(v) => v,
+        None => {
+            return quote! {
+                compile_error!("bamboo-css: styled! expects `styled!(tag, { /* CSS */ })`")
+            }
+            .into();
+        }
+    };
+
+    let hash = generate_hash(&tokens_to_hash_input(css_tokens.clone()));
+    let css_body = tokens_to_css(css_tokens);
+
+    let processed = match process_css(&hash, &css_body) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("bamboo-css: {e}");
+            return quote! { compile_error!(#msg) }.into();
+        }
+    };
+
+    if let Err(e) =
+        find_workspace_root().and_then(|root| write_fragment(&root, &hash, &processed))
+    {
+        let msg = format!("bamboo-css: {e}");
+        return quote! { compile_error!(#msg) }.into();
+    }
+
+    let tag_ident = proc_macro2::Ident::new(&tag, proc_macro2::Span::call_site());
+    let hash_lit = proc_macro2::Literal::string(&hash);
+
+    // Return a closure: |children: ::leptos::Children| -> impl IntoView
+    // The tag and class are baked in; the user supplies only the children.
+    quote! {
+        move |children: ::leptos::Children| {
+            let __class = #hash_lit;
+            ::leptos::view! {
+                <#tag_ident class=__class>
+                    {children()}
+                </#tag_ident>
+            }
+        }
+    }
+    .into()
+}
+
 /// Splits a `TokenStream` on top-level commas.
 fn split_by_comma(input: TokenStream2) -> Vec<TokenStream2> {
     let mut args: Vec<TokenStream2> = Vec::new();

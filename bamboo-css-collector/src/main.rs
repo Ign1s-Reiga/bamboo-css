@@ -43,34 +43,75 @@ fn generate_hash(normalized: &str) -> String {
     format!("css-{:08x}", h.finish() as u32)
 }
 
-/// Returns the raw text content of every `css! { … }` block found in `source`.
+/// Returns the byte offset of the matching closing `}` in `source[start..]`,
+/// where `start` is the byte offset just *after* an already-matched opening `{`.
+fn find_brace_end(source: &str, start: usize) -> Option<usize> {
+    let rest = &source[start..];
+    let mut depth: usize = 1;
+    for (byte_pos, ch) in rest.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + byte_pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns the raw text content of every `css! { … }` and `styled!(…, { … })`
+/// block found in `source` (the part between the outer braces, not including
+/// the braces themselves).
 fn extract_css_blocks(source: &str) -> Vec<&str> {
-    // Compile once per call; in practice this is called per file so it's fine.
-    let re = Regex::new(r"css!\s*\{").unwrap();
+    let css_re = Regex::new(r"css!\s*\{").unwrap();
+    let styled_re = Regex::new(r"styled!\s*\(").unwrap();
     let mut blocks = Vec::new();
 
-    for mat in re.find_iter(source) {
-        let inner_start = mat.end(); // byte offset just after the opening `{`
-        let rest = &source[inner_start..];
-        let mut depth: usize = 1;
-        let mut inner_end = None;
+    // --- css! { … } ---
+    for mat in css_re.find_iter(source) {
+        let inner_start = mat.end();
+        if let Some(end) = find_brace_end(source, inner_start) {
+            blocks.push(&source[inner_start..end]);
+        }
+    }
+
+    // --- styled!(tag, { … }) ---
+    for mat in styled_re.find_iter(source) {
+        // `mat.end()` is just after the `(`.  We need to find the CSS brace
+        // block, which comes after the tag token and a comma.  Walk through
+        // the paren contents character-by-character looking for the first `{`
+        // that is at paren-depth 0 (i.e. not nested inside sub-parens).
+        let after_paren = mat.end();
+        let rest = &source[after_paren..];
+        let mut paren_depth: usize = 0;
+        let mut css_brace_start: Option<usize> = None;
 
         for (byte_pos, ch) in rest.char_indices() {
             match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        inner_end = Some(byte_pos);
+                '(' => paren_depth += 1,
+                ')' => {
+                    if paren_depth == 0 {
+                        // Closed the outer paren — no CSS brace found.
                         break;
                     }
+                    paren_depth -= 1;
+                }
+                '{' if paren_depth == 0 => {
+                    css_brace_start = Some(after_paren + byte_pos + 1); // just after `{`
+                    break;
                 }
                 _ => {}
             }
         }
 
-        if let Some(end) = inner_end {
-            blocks.push(&source[inner_start..inner_start + end]);
+        if let Some(inner_start) = css_brace_start {
+            if let Some(end) = find_brace_end(source, inner_start) {
+                blocks.push(&source[inner_start..end]);
+            }
         }
     }
 
@@ -136,8 +177,6 @@ fn collect_live_hashes(src_dir: &Path) -> HashSet<String> {
         for block in extract_css_blocks(&source) {
             let normalized = normalize_for_hash(block);
             let hash = generate_hash(normalized.as_str());
-            println!("{normalized}, {hash}");
-
             live.insert(hash);
         }
     }
