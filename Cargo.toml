@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["bamboo-css-macro", "bamboo-css-collector"]
+
+[workspace.dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["parsing"] }
+lightningcss = "1.0.0-alpha.71"
+cargo_metadata = "0.23"
+regex = "1"
+walkdir = "2"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
