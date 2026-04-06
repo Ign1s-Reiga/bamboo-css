@@ -50,9 +50,12 @@ styled!(StyledInput, input, {
     padding: 0.5rem;
 });
 
-view! {
-    <Card><p>"Hello"</p></Card>
-    <StyledInput type="text" placeholder="Enter text…" />
+#[component]
+fn Component() -> impl IntoView {
+    view! {
+        <Card><p>"Hello"</p></Card>
+        <StyledInput type="text" placeholder="Enter text…" />
+    }
 }
 ```
 

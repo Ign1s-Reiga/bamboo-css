@@ -138,6 +138,8 @@ fn write_fragment(workspace_root: &PathBuf, hash: &str, css: &str) -> Result<(),
     let path = dir.join(format!("{hash}.css"));
 
     // Uses `create_new` so parallel macro invocations that produce the same
+    // hash (identical CSS) never race: only one writer succeeds; the rest hit
+    // `AlreadyExists` and skip silently.
     match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut f) => f
             .write_all(css.as_bytes())
@@ -271,12 +273,14 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream
 ///
 /// Processes the CSS through the same pipeline as `css!` (hash, validate,
 /// minify, write fragment) and emits a `#[component]` function with the given
-/// name.  Arbitrary HTML attributes are forwarded to the underlying element
-/// via `AttributeInterceptor`, so props like `value`, `type`, `href`, etc.
-/// all work without any extra configuration.
+/// name.
 ///
 /// **Void elements** (`input`, `img`, `br`, …) generate a component with no
-/// `children` prop.  All other elements accept `children`.
+/// `children` prop.  Arbitrary HTML attributes (e.g. `attr:type`,
+/// `attr:value`) are forwarded to the inner element via `AttributeInterceptor`.
+///
+/// **All other elements** generate a component that accepts `children` and
+/// renders them inside the scoped element.
 ///
 /// The scoped class is always applied; it cannot be overridden by callers.
 ///
@@ -358,11 +362,13 @@ pub fn styled(input: TokenStream) -> TokenStream {
     ];
 
     if VOID_ELEMENTS.contains(&tag.as_str()) {
-        // Self-closing: no children prop; forward arbitrary HTML attributes
-        // via `#[prop(attrs)]` (e.g. `value`, `type`, `placeholder`, …).
+        // Void/self-closing element: no children prop.  Arbitrary HTML
+        // attributes (e.g. `attr:type`, `attr:value`, `attr:placeholder`) are
+        // forwarded to the inner element via `AttributeInterceptor`.
         quote! {
             #[::leptos::component]
             fn #component_ident() -> impl ::leptos::IntoView {
+                use ::leptos::prelude::AddAnyAttr;
                 use ::leptos::attribute_interceptor::AttributeInterceptor;
                 ::leptos::view! {
                     <AttributeInterceptor let:attr>
@@ -373,19 +379,18 @@ pub fn styled(input: TokenStream) -> TokenStream {
         }
         .into()
     } else {
-        // Normal element: accept children plus arbitrary HTML attributes.
+        // Normal element: accepts children rendered inside the scoped element.
+        // `Children` (`Box<dyn FnOnce() -> AnyView>`) is called once directly
+        // in the component body — no outer `Fn` closure is needed here.
         quote! {
             #[::leptos::component]
             fn #component_ident(
-                children: ::leptos::children::ChildrenFn,
+                children: ::leptos::children::Children,
             ) -> impl ::leptos::IntoView {
-                use ::leptos::attribute_interceptor::AttributeInterceptor;
                 ::leptos::view! {
-                    <AttributeInterceptor let:attr>
-                        <#tag_ident class=#hash_lit  {..attr}>
-                            {children()}
-                        </#tag_ident>
-                    </AttributeInterceptor>
+                    <#tag_ident class=#hash_lit>
+                        {children()}
+                    </#tag_ident>
                 }
             }
         }
