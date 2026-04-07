@@ -1,36 +1,44 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Delimiter, LineColumn, TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Delimiter, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Reconstructs a CSS string from a TokenStream by using source span positions to decide whether a space should be inserted between adjacent tokens.
+/// Reconstructs a CSS string from a TokenStream using a CSS-aware heuristic:
+/// a space is inserted between two adjacent tokens only when neither is a
+/// punctuation character and the incoming token is not a group.  This keeps
+/// compound property names (`background-color`), percentage values (`50%`),
+/// function calls (`rgba(…)`), and pseudo-selectors (`&:hover`) tight, while
+/// correctly separating adjacent values (`50px 50px`, `0.15s ease`).
 fn tokens_to_css(input: TokenStream2) -> String {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
     let mut out = String::new();
-    append_tokens(&tokens, &mut out);
+    // `prev_is_punct = true` at the start so the first token never gets a
+    // leading space.
+    append_tokens(&tokens, &mut out, true);
     out
 }
 
-fn append_tokens(tokens: &[TokenTree], out: &mut String) {
-    let mut prev_end: Option<LineColumn> = None;
-
+/// Appends the text of `tokens` to `out`, inserting spaces according to the
+/// CSS-aware rule described on `tokens_to_css`.
+///
+/// `prev_is_punct` should be `true` when the character immediately preceding
+/// the first token in `tokens` is a punctuation character (or the buffer is
+/// empty / we just opened a delimiter), so that no spurious leading space is
+/// emitted.
+fn append_tokens(tokens: &[TokenTree], out: &mut String, mut prev_is_punct: bool) {
     for tt in tokens {
-        // The "start" of a group is its opening delimiter, not the whole span.
-        let start = match tt {
-            TokenTree::Group(g) => g.span_open().start(),
-            _ => tt.span().start(),
-        };
+        let is_punct = matches!(tt, TokenTree::Punct(_));
+        let is_group = matches!(tt, TokenTree::Group(_));
 
-        // Insert a space whenever tokens are not directly adjacent in source.
-        if let Some(end) = prev_end {
-            if end != start {
-                out.push(' ');
-            }
+        // Insert a space only when neither the previous nor the current token
+        // is a punctuation character, and the current token is not a group.
+        if !prev_is_punct && !is_punct && !is_group {
+            out.push(' ');
         }
 
-        let end = match tt {
+        match tt {
             TokenTree::Group(g) => {
                 let (open, close) = match g.delimiter() {
                     Delimiter::Brace => ("{", "}"),
@@ -40,25 +48,17 @@ fn append_tokens(tokens: &[TokenTree], out: &mut String) {
                 };
                 out.push_str(open);
                 let inner: Vec<TokenTree> = g.stream().into_iter().collect();
-                append_tokens(&inner, out);
+                // After the opening delimiter, treat it like a punct so the
+                // first inner token does not get a spurious leading space.
+                append_tokens(&inner, out, true);
                 out.push_str(close);
-                g.span_close().end()
             }
-            TokenTree::Ident(id) => {
-                out.push_str(&id.to_string());
-                tt.span().end()
-            }
-            TokenTree::Punct(p) => {
-                out.push(p.as_char());
-                tt.span().end()
-            }
-            TokenTree::Literal(lit) => {
-                out.push_str(&lit.to_string());
-                tt.span().end()
-            }
-        };
+            TokenTree::Ident(id) => out.push_str(&id.to_string()),
+            TokenTree::Punct(p) => out.push(p.as_char()),
+            TokenTree::Literal(lit) => out.push_str(&lit.to_string()),
+        }
 
-        prev_end = Some(end);
+        prev_is_punct = is_punct;
     }
 }
 
