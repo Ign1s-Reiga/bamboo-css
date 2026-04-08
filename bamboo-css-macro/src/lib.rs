@@ -367,7 +367,7 @@ pub fn styled(input: TokenStream) -> TokenStream {
         // forwarded to the inner element via `AttributeInterceptor`.
         quote! {
             #[::leptos::component]
-            fn #component_ident() -> impl ::leptos::IntoView {
+            pub fn #component_ident() -> impl ::leptos::IntoView {
                 use ::leptos::prelude::AddAnyAttr;
                 use ::leptos::attribute_interceptor::AttributeInterceptor;
                 ::leptos::view! {
@@ -384,13 +384,20 @@ pub fn styled(input: TokenStream) -> TokenStream {
         // in the component body — no outer `Fn` closure is needed here.
         quote! {
             #[::leptos::component]
-            fn #component_ident(
-                children: ::leptos::children::Children,
+            pub fn #component_ident(
+                children: ::leptos::children::ChildrenFn,
             ) -> impl ::leptos::IntoView {
+                use ::leptos::prelude::AddAnyAttr;
+                use ::leptos::attribute_interceptor::AttributeInterceptor;
+                
+                let children = ::leptos::reactive::owner::StoredValue::new(children);
+                
                 ::leptos::view! {
-                    <#tag_ident class=#hash_lit>
-                        {children()}
-                    </#tag_ident>
+                    <AttributeInterceptor let:attr>
+                        <#tag_ident class=#hash_lit  {..attr}>
+                            {children.read_value()()}
+                        </#tag_ident>
+                    </AttributeInterceptor>
                 }
             }
         }
