@@ -277,10 +277,12 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream
 ///
 /// **Void elements** (`input`, `img`, `br`, …) generate a component with no
 /// `children` prop.  Arbitrary HTML attributes (e.g. `attr:type`,
-/// `attr:value`) are forwarded to the inner element via `AttributeInterceptor`.
+/// `attr:value`) can be passed via Leptos' standard `attr:*` syntax.
 ///
-/// **All other elements** generate a component that accepts `children` and
-/// renders them inside the scoped element.
+/// **All other elements** generate a component that accepts a `children:
+/// Children` prop rendered inside the scoped element.  Arbitrary HTML
+/// attributes (e.g. `attr:style="…"`) can likewise be passed via Leptos'
+/// standard `attr:*` syntax.
 ///
 /// The scoped class is always applied; it cannot be overridden by callers.
 ///
@@ -306,7 +308,7 @@ fn parse_styled_args(input: TokenStream2) -> Option<(String, String, TokenStream
 ///     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
 /// });
 ///
-/// // Void element — no children, props forwarded as HTML attributes
+/// // Void element — no children
 /// styled!(StyledInput, input, {
 ///     border: none;
 ///     padding: 0.5rem;
@@ -363,41 +365,33 @@ pub fn styled(input: TokenStream) -> TokenStream {
 
     if VOID_ELEMENTS.contains(&tag.as_str()) {
         // Void/self-closing element: no children prop.  Arbitrary HTML
-        // attributes (e.g. `attr:type`, `attr:value`, `attr:placeholder`) are
-        // forwarded to the inner element via `AttributeInterceptor`.
+        // attributes are passed via Leptos' standard `attr:*` syntax.
         quote! {
             #[::leptos::component]
             pub fn #component_ident() -> impl ::leptos::IntoView {
-                use ::leptos::prelude::AddAnyAttr;
-                use ::leptos::attribute_interceptor::AttributeInterceptor;
+                use ::leptos::prelude::ClassAttribute;
+
                 ::leptos::view! {
-                    <AttributeInterceptor let:attr>
-                        <#tag_ident class=#hash_lit  {..attr}/>
-                    </AttributeInterceptor>
+                    <#tag_ident class=#hash_lit/>
                 }
             }
         }
         .into()
     } else {
         // Normal element: accepts children rendered inside the scoped element.
-        // `Children` (`Box<dyn FnOnce() -> AnyView>`) is called once directly
-        // in the component body — no outer `Fn` closure is needed here.
+        // Arbitrary HTML attributes can be passed as `attr:*` props via
+        // Leptos' standard attribute syntax.
         quote! {
             #[::leptos::component]
             pub fn #component_ident(
-                children: ::leptos::children::ChildrenFn,
+                children: ::leptos::children::Children,
             ) -> impl ::leptos::IntoView {
-                use ::leptos::prelude::AddAnyAttr;
-                use ::leptos::attribute_interceptor::AttributeInterceptor;
-                
-                let children = ::leptos::reactive::owner::StoredValue::new(children);
-                
+                use ::leptos::prelude::ClassAttribute;
+
                 ::leptos::view! {
-                    <AttributeInterceptor let:attr>
-                        <#tag_ident class=#hash_lit  {..attr}>
-                            {children.read_value()()}
-                        </#tag_ident>
-                    </AttributeInterceptor>
+                    <#tag_ident class=#hash_lit>
+                        {children()}
+                    </#tag_ident>
                 }
             }
         }
