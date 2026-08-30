@@ -1,68 +1,158 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Delimiter, TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Delimiter, Group, LineColumn, Span, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Reconstructs a CSS string from a TokenStream using a CSS-aware heuristic:
-/// a space is inserted between two adjacent tokens only when neither is a
-/// punctuation character and the incoming token is not a group.  This keeps
-/// compound property names (`background-color`), percentage values (`50%`),
-/// function calls (`rgba(…)`), and pseudo-selectors (`&:hover`) tight, while
-/// correctly separating adjacent values (`50px 50px`, `0.15s ease`).
+/// Reconstructs a CSS string from a `TokenStream`, restoring the whitespace
+/// the tokens carried in the user's source file.
+///
+/// Whitespace is significant in CSS in places the token kinds cannot reveal:
+/// `& img` (descendant) versus `&img` (compound), `calc(100% + 4px)` versus the
+/// unparseable `calc(100%+4px)`, `translateX(-4px)` versus the invalid
+/// `translateX(- 4px)`.  Which of the two was written is a property of the
+/// source text, not of the tokens, so the spacing is recovered from span
+/// locations: two tokens were adjacent in the source exactly when the first
+/// one's end position is the second one's start position.
+///
+/// `Punct::spacing()` cannot stand in for this — it only reports whether a
+/// punct is glued to the *next punct*, so the `&` of both `& img` and `&:hover`
+/// is `Alone`.
+///
+/// Tokens with no usable location — synthetic streams built by `quote!`, or a
+/// toolchain that does not expose span locations — fall back to the earlier
+/// heuristic: a space between two non-punctuation tokens.
 fn tokens_to_css(input: TokenStream2) -> String {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
     let mut out = String::new();
-    // `prev_is_punct = true` at the start so the first token never gets a
-    // leading space.
-    append_tokens(&tokens, &mut out, true);
+    Spacer::new().append_tokens(&tokens, &mut out);
     out
 }
 
-/// Appends the text of `tokens` to `out`, inserting spaces according to the
-/// CSS-aware rule described on `tokens_to_css`.
+/// Returns where `span` starts and ends in the source, or `None` when it
+/// carries no usable location.
 ///
-/// `prev_is_punct` should be `true` when the character immediately preceding
-/// the first token in `tokens` is a punctuation character (or the buffer is
-/// empty / we just opened a delimiter), so that no spurious leading space is
-/// emitted.
-fn append_tokens(tokens: &[TokenTree], out: &mut String, mut prev_is_punct: bool) {
-    for tt in tokens {
-        let is_punct = matches!(tt, TokenTree::Punct(_));
-        let is_group = matches!(tt, TokenTree::Group(_));
+/// Every real token covers at least one column, so a zero-width span means
+/// either a synthetic token or a toolchain without span locations — proc-macro2
+/// reports a single fixed position for every such span, which would make every
+/// pair of tokens look adjacent.
+fn span_bounds(span: Span) -> Option<(LineColumn, LineColumn)> {
+    let (start, end) = (span.start(), span.end());
+    if start == end { None } else { Some((start, end)) }
+}
 
-        // Insert a space only when neither the previous nor the current token
-        // is a punctuation character, and the current token is not a group.
-        if !prev_is_punct && !is_punct && !is_group {
+/// Tracks what was written last so the right amount of whitespace goes in front
+/// of the next token.
+struct Spacer {
+    /// Source position just past the previously written token, when it had one.
+    prev_end: Option<LineColumn>,
+    /// Whether the previously written token was a punctuation character.  Only
+    /// consulted when a location is missing on either side of the gap.
+    prev_is_punct: bool,
+}
+
+impl Spacer {
+    /// Starts as if a punctuation character preceded the stream, so the first
+    /// token never picks up a leading space.
+    fn new() -> Self {
+        Self { prev_end: None, prev_is_punct: true }
+    }
+
+    /// Writes the separator that belongs in front of a token which starts at
+    /// `start` in the source.
+    fn separate(
+        &self,
+        out: &mut String,
+        start: Option<LineColumn>,
+        is_punct: bool,
+        is_group: bool,
+    ) {
+        let space = match (self.prev_end, start) {
+            // Both sides located, and in source order: the source had
+            // whitespace here exactly when the two positions do not meet.
+            (Some(prev_end), Some(start)) if start >= prev_end => start != prev_end,
+            // Either side is unlocated, or the positions run backwards because
+            // the tokens were spliced in from elsewhere.  Neither can be
+            // compared, so fall back to the token-kind heuristic.
+            _ => !self.prev_is_punct && !is_punct && !is_group,
+        };
+        if space {
             out.push(' ');
         }
+    }
 
-        match tt {
-            TokenTree::Group(g) => {
-                let (open, close) = match g.delimiter() {
-                    Delimiter::Brace => ("{", "}"),
-                    Delimiter::Bracket => ("[", "]"),
-                    Delimiter::Parenthesis => ("(", ")"),
-                    Delimiter::None => ("", ""),
-                };
-                out.push_str(open);
-                let inner: Vec<TokenTree> = g.stream().into_iter().collect();
-                // After the opening delimiter, treat it like a punct so the
-                // first inner token does not get a spurious leading space.
-                append_tokens(&inner, out, true);
-                out.push_str(close);
-            }
-            TokenTree::Ident(id) => out.push_str(&id.to_string()),
-            TokenTree::Punct(p) => out.push(p.as_char()),
-            TokenTree::Literal(lit) => out.push_str(&lit.to_string()),
+    /// Records the token just written as the new left-hand side of the next gap.
+    fn advance(&mut self, end: Option<LineColumn>, is_punct: bool) {
+        self.prev_end = end;
+        self.prev_is_punct = is_punct;
+    }
+
+    /// Appends the text of `tokens` to `out`, separated as they were in source.
+    fn append_tokens(&mut self, tokens: &[TokenTree], out: &mut String) {
+        for tt in tokens {
+            let (text, is_punct) = match tt {
+                TokenTree::Group(g) => {
+                    self.append_group(g, out);
+                    continue;
+                }
+                TokenTree::Ident(id) => (id.to_string(), false),
+                TokenTree::Punct(p) => (p.as_char().to_string(), true),
+                TokenTree::Literal(lit) => (lit.to_string(), false),
+            };
+
+            let bounds = span_bounds(tt.span());
+            self.separate(out, bounds.map(|(start, _)| start), is_punct, false);
+            out.push_str(&text);
+            self.advance(bounds.map(|(_, end)| end), is_punct);
         }
+    }
 
-        prev_is_punct = is_punct;
+    /// Appends a delimited group, spacing the delimiters themselves from their
+    /// surroundings the same way as any other token.
+    fn append_group(&mut self, group: &Group, out: &mut String) {
+        let (open, close) = match group.delimiter() {
+            Delimiter::Brace => ("{", "}"),
+            Delimiter::Bracket => ("[", "]"),
+            Delimiter::Parenthesis => ("(", ")"),
+            // An invisible delimiter writes nothing, so its contents simply
+            // continue the surrounding run rather than interrupting it.
+            Delimiter::None => {
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                self.append_tokens(&inner, out);
+                return;
+            }
+        };
+
+        let open_bounds = span_bounds(group.span_open());
+        let close_bounds = span_bounds(group.span_close());
+
+        self.separate(out, open_bounds.map(|(start, _)| start), false, true);
+        out.push_str(open);
+        // Within the group the opening character stands in for the previous
+        // token; calling it punctuation keeps the fallback from opening with a
+        // spurious space.
+        self.advance(open_bounds.map(|(_, end)| end), true);
+
+        let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+        self.append_tokens(&inner, out);
+
+        self.separate(out, close_bounds.map(|(start, _)| start), true, false);
+        out.push_str(close);
+        // A group as a whole is not punctuation, which is how the fallback
+        // heuristic has always spaced one from whatever follows it.
+        self.advance(close_bounds.map(|(_, end)| end), false);
     }
 }
 
-/// Concatenates every token's text without any separators, recursing into groups.
+/// Concatenates every token's text without any separators, recursing into
+/// groups.
+///
+/// The result is the hash input, and it is deliberately whitespace-independent:
+/// `bamboo-css-collector` re-derives the same string from the source text with
+/// its own `normalize_for_hash`, and only ever sees whatever spacing the user
+/// typed.  Spacing therefore belongs in `tokens_to_css` alone — routing it
+/// through here would desynchronise the two and break dead-code elimination.
 fn tokens_to_hash_input(tokens: TokenStream2) -> String {
     let mut out = String::new();
     for tt in tokens {
@@ -469,4 +559,111 @@ pub fn cx(input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tokenizes `body` and reconstructs the CSS text the macro hands to
+    /// lightningcss.  Parsing from a string gives the tokens real span
+    /// locations, so this exercises the same path as a macro invocation.
+    fn emit(body: &str) -> String {
+        let tokens: TokenStream2 = body.parse().expect("body should tokenize");
+        tokens_to_css(tokens)
+    }
+
+    /// Runs `body` through the full pipeline, ending in minified CSS scoped to
+    /// `.css-test`.
+    fn minify(body: &str) -> String {
+        process_css("css-test", &emit(body)).expect("CSS should be valid")
+    }
+
+    #[test]
+    fn descendant_selector_keeps_its_space() {
+        // `&img` is a compound selector — "is both the scope class and an img" —
+        // and matches nothing.
+        assert_eq!(emit("& img { color: red }"), "& img { color: red }");
+        assert_eq!(minify("& img { color: red }"), ".css-test{& img{color:red}}");
+        assert_eq!(minify("& svg { color: red }"), ".css-test{& svg{color:red}}");
+    }
+
+    #[test]
+    fn child_combinator_stays_tight() {
+        assert_eq!(minify("& > img { color: red }"), ".css-test{&>img{color:red}}");
+    }
+
+    #[test]
+    fn pseudo_classes_do_not_gain_a_space() {
+        // `& :hover` would select hovered descendants instead of the element.
+        assert_eq!(minify("&:hover { color: red }"), ".css-test{&:hover{color:red}}");
+        assert_eq!(
+            minify("&:disabled { color: red }"),
+            ".css-test{&:disabled{color:red}}"
+        );
+        assert_eq!(
+            minify("&:last-child { color: red }"),
+            ".css-test{&:last-child{color:red}}"
+        );
+    }
+
+    #[test]
+    fn calc_keeps_the_spaces_its_operators_need() {
+        // `calc(100%+4px)` and `calc(100vh-340px)` are both invalid, and
+        // lightningcss hands them straight through rather than complaining —
+        // the browser is what drops the declaration, which is why losing these
+        // spaces was silent all the way to the rendered page.
+        assert_eq!(
+            minify("top: calc(100% + 4px);"),
+            ".css-test{top:calc(100% + 4px)}"
+        );
+        assert_eq!(
+            minify("max-height: calc(100vh - 340px);"),
+            ".css-test{max-height:calc(100vh - 340px)}"
+        );
+    }
+
+    #[test]
+    fn unary_minus_stays_glued_to_its_number() {
+        // A space here would make it a subtraction with a missing left operand.
+        assert_eq!(emit("transform: translateX(-4px);"), "transform: translateX(-4px);");
+        // lightningcss rewrites `translateX` to the shorter `translate`.
+        assert_eq!(
+            minify("transform: translateX(-4px);"),
+            ".css-test{transform:translate(-4px)}"
+        );
+    }
+
+    #[test]
+    fn multi_value_declarations_keep_their_separators() {
+        assert_eq!(minify("margin: 0 auto;"), ".css-test{margin:0 auto}");
+        assert_eq!(
+            minify("grid-template-columns: 28px 1fr auto auto;"),
+            ".css-test{grid-template-columns:28px 1fr auto auto}"
+        );
+        assert_eq!(
+            minify("transition: background-color .15s, opacity .15s;"),
+            ".css-test{transition:background-color .15s,opacity .15s}"
+        );
+    }
+
+    #[test]
+    fn spacing_never_reaches_the_hash() {
+        // The collector re-derives hashes from source text whose spacing it
+        // never inspects, so differently spaced bodies must hash alike.
+        let spaced: TokenStream2 = "& img { color : red }".parse().unwrap();
+        let tight: TokenStream2 = "&img{color:red}".parse().unwrap();
+        assert_eq!(
+            generate_hash(&tokens_to_hash_input(spaced)),
+            generate_hash(&tokens_to_hash_input(tight)),
+        );
+    }
+
+    #[test]
+    fn unlocated_tokens_fall_back_to_the_token_kind_heuristic() {
+        // `quote!` builds tokens with no source position, so spacing falls back
+        // to the older rule: a space between two non-punctuation tokens.
+        let synthetic = quote! { color: red; padding: 4px 8px; };
+        assert_eq!(tokens_to_css(synthetic), "color:red;padding:4px 8px;");
+    }
 }
