@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Delimiter, Group, LineColumn, Span, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// Reconstructs a CSS string from a `TokenStream`, restoring the whitespace
 /// the tokens carried in the user's source file.
@@ -61,6 +63,15 @@ impl Spacer {
 
     /// Writes the separator that belongs in front of a token which starts at
     /// `start` in the source.
+    ///
+    /// Known limitation: rustc drops comments before the macro sees the tokens
+    /// but leaves the gap they occupied, so a comment written *inside* a
+    /// selector reads here as the whitespace that replaced it — `&/**/:hover`
+    /// becomes `& :hover`, a descendant selector.  Nothing in the token stream
+    /// separates an elided comment from real whitespace; the APIs that could,
+    /// `Span::join` and `Span::byte_range`, are both nightly-only.  Comments
+    /// between declarations or on their own line are unaffected, since the
+    /// newline around them is whitespace anyway.
     fn separate(
         &self,
         out: &mut String,
@@ -220,25 +231,81 @@ fn find_workspace_root() -> Result<PathBuf, String> {
     Ok(metadata.workspace_root.into())
 }
 
+/// Fragment hashes this process has already written.
+///
+/// It is what tells a fragment left behind by an earlier build apart from a
+/// second body claiming the same hash during *this* one.
+static CLAIMED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Distinguishes the temporary files of concurrent writers within one process.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Writes `target/styled-fragments/{hash}.css` under the workspace root.
-fn write_fragment(workspace_root: &PathBuf, hash: &str, css: &str) -> Result<(), String> {
+///
+/// This used to open with `create_new` and skip on `AlreadyExists`, reasoning
+/// that the same hash implied the same content.  That no longer holds:
+/// `tokens_to_hash_input` ignores whitespace while `tokens_to_css` now
+/// preserves it, so two bodies differing only in spacing share a hash yet can
+/// describe different CSS.  Skipping would then serve whichever body was
+/// compiled first — and, across builds, would keep serving CSS from before an
+/// edit that changed only spacing, since the file name never changes.
+///
+/// So the content decides.  Matching content is the ordinary case and costs
+/// nothing; differing content is either a stale fragment, which is replaced, or
+/// two live bodies under one class name, which cannot both be honoured and is
+/// reported instead.
+///
+/// `CLAIMED` separates those two only within one proc-macro process, which is
+/// one crate.  A pair of colliding bodies in *different* crates still reads as
+/// staleness, and the later one wins.  Closing that gap would mean making the
+/// hash itself spacing-aware, which would rename every class every consumer
+/// already ships.
+fn write_fragment(workspace_root: &Path, hash: &str, css: &str) -> Result<(), String> {
     let dir = workspace_root.join("target").join("styled-fragments");
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create fragments dir: {e}"))?;
 
     let path = dir.join(format!("{hash}.css"));
+    // Claim before reading, so the check below sees this invocation too.  A
+    // poisoned lock is treated as a first claim: replacing a fragment is the
+    // recoverable outcome, refusing to compile is not.
+    let first_claim = CLAIMED
+        .lock()
+        .map(|mut claimed| claimed.insert(hash.to_string()))
+        .unwrap_or(true);
 
-    // Uses `create_new` so parallel macro invocations that produce the same
-    // hash (identical CSS) never race: only one writer succeeds; the rest hit
-    // `AlreadyExists` and skip silently.
-    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut f) => f
-            .write_all(css.as_bytes())
-            .map_err(|e| format!("failed to write fragment: {e}"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Same hash ⟹ same content; nothing to do.
+    match fs::read_to_string(&path) {
+        // Already current.  Two identical bodies deduplicating onto one class
+        // land here, which is the whole point of hashing the content.
+        Ok(existing) if existing == css => return Ok(()),
+        Ok(_) if !first_claim => {
+            return Err(format!(
+                "two css! bodies map to `{hash}` but produce different CSS, so \
+                 they differ only in whitespace — which the class hash ignores \
+                 by design. One class cannot carry both rules. Make the two \
+                 bodies agree, or change one enough that they hash apart."
+            ));
         }
-        Err(e) => return Err(format!("failed to open fragment for writing: {e}")),
+        // Left over from an earlier build, from before an edit that changed
+        // only spacing.  Replace it.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to read fragment: {e}")),
     }
+
+    // Publish by rename so that macro invocations in parallel processes never
+    // observe a half-written fragment — the property `create_new` used to
+    // provide.
+    let tmp = dir.join(format!(
+        "{hash}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, css).map_err(|e| format!("failed to write fragment: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to publish fragment: {e}")
+    })?;
 
     Ok(())
 }
@@ -657,6 +724,72 @@ mod tests {
             generate_hash(&tokens_to_hash_input(spaced)),
             generate_hash(&tokens_to_hash_input(tight)),
         );
+    }
+
+    /// A throwaway stand-in for a workspace root, placed under the real
+    /// `target/` so the scratch files land in the build directory rather than
+    /// in the system temp directory.
+    ///
+    /// Each test passes its own `name` *and* its own hash: `CLAIMED` is
+    /// process-global and the harness runs tests in parallel, so sharing either
+    /// would make them read each other's state.
+    fn scratch_root(name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the macro crate sits inside the workspace")
+            .join("target")
+            .join("fragment-tests")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn fragment_path(root: &Path, hash: &str) -> PathBuf {
+        root.join("target")
+            .join("styled-fragments")
+            .join(format!("{hash}.css"))
+    }
+
+    #[test]
+    fn an_unchanged_fragment_is_left_alone() {
+        // Two identical bodies deduplicating onto one class.
+        let root = scratch_root("unchanged");
+        let hash = "css-testunchanged";
+        write_fragment(&root, hash, ".a{color:red}").unwrap();
+        write_fragment(&root, hash, ".a{color:red}").unwrap();
+        assert_eq!(
+            fs::read_to_string(fragment_path(&root, hash)).unwrap(),
+            ".a{color:red}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fragment_left_by_an_earlier_build_is_replaced() {
+        // The hash survives an edit that changes only spacing, so the file name
+        // does not move and `create_new` would have served this forever.
+        let root = scratch_root("stale");
+        let hash = "css-teststale";
+        let path = fragment_path(&root, hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, ".a{&img{width:28px}}").unwrap();
+
+        write_fragment(&root, hash, ".a{& img{width:28px}}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ".a{& img{width:28px}}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_live_bodies_under_one_hash_are_reported() {
+        // `& img` and `&img` hash alike but no longer emit alike, and one class
+        // cannot carry both rules.
+        let root = scratch_root("collision");
+        let hash = "css-testcollision";
+        write_fragment(&root, hash, ".a{& img{width:28px}}").unwrap();
+        let err = write_fragment(&root, hash, ".a{&img{width:28px}}")
+            .expect_err("a second body under one hash must not pass silently");
+        assert!(err.contains("differ only in whitespace"), "{err}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
